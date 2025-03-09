@@ -1,6 +1,7 @@
 use base64::{decode, encode};
 use sha2::{Sha256, Digest};
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
+use std::thread::sleep;
 
 use ureq::*;
 use serde_derive::{Deserialize, Serialize};
@@ -11,12 +12,18 @@ use std::fmt::Write;
 const ENDPOINT: &str = "https://userservice.rebellion.co.uk/rosacap";
 const APPLICATION: &str = "2000ad";
 const APPLICATION_KEY: &str = "ibzGYfeYbyVtbxDlzudDXdpwPk3u9UJ8sRin8WS7DKU=";
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+const REQUEST_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Client {
     device_id: String,
     security_token: Option<String>,
     renewal_token: Option<String>,
-    user_id: Option<u64>
+    user_id: Option<u64>,
+    email: Option<String>,
+    password: Option<String>,
+    last_request: Option<SystemTime>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,73 +58,133 @@ impl Client {
             device_id,
             security_token: None,
             renewal_token: None,
-            user_id: None
+            user_id: None,
+            email: None,
+            password: None,
+            last_request: None
         }
     }
 
     pub fn login(&mut self, email_address: &str, password: &str) -> Result<(), String> {
-        let challenge_token = self.auth_request(email_address)?;
+        self.email = Some(email_address.to_string());
+        self.password = Some(password.to_string());
+        self.do_login()
+    }
 
-        let mut hasher = Sha256::new();
-        hasher.update(email_address);
-        hasher.update(b"REBELLION");
-        hasher.update(password);
-        let id_hash = hasher.finalize();
+    fn do_login(&mut self) -> Result<(), String> {
+        if let Some(email) = &self.email {
+            let email = email.clone();
+            let challenge_token = self.auth_request(&email)?;
 
-        let mut hasher = Sha256::new();
-        hasher.update(decode(challenge_token.as_str()).unwrap());
-        hasher.update(id_hash);
-        let token_bytes = hasher.finalize();
+            let mut hasher = Sha256::new();
+            hasher.update(&email);
+            hasher.update(b"REBELLION");
+            if let Some(password) = &self.password {
+                hasher.update(password);
+            }
+            let id_hash = hasher.finalize();
 
-        self.authenticate(challenge_token, encode(token_bytes))
+            let mut hasher = Sha256::new();
+            hasher.update(decode(challenge_token.as_str()).unwrap());
+            hasher.update(id_hash);
+            let token_bytes = hasher.finalize();
+
+            self.authenticate(challenge_token, encode(token_bytes))
+        } else {
+            Err("No email/password stored for reauth".to_string())
+        }
+    }
+
+    fn handle_rate_limit(&mut self) {
+        if let Some(last_request) = self.last_request {
+            if let Ok(elapsed) = last_request.elapsed() {
+                if elapsed < REQUEST_DELAY {
+                    sleep(REQUEST_DELAY - elapsed);
+                }
+            }
+        }
+        self.last_request = Some(SystemTime::now());
+    }
+
+    fn with_retry<T, F>(&mut self, mut f: F) -> Result<T, String>
+    where
+        F: FnMut(&mut Self) -> Result<T, String>,
+    {
+        let mut last_error = None;
+        for attempt in 0..MAX_RETRIES {
+            self.handle_rate_limit();
+            match f(self) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_error = Some(e.clone());
+                    if e.contains("User not authorized") {
+                        // Try to reauth
+                        if let Err(_) = self.do_login() {
+                            // If reauth fails, continue with retry
+                            sleep(RETRY_DELAY * (attempt + 1));
+                            continue;
+                        }
+                        // If reauth succeeds, retry immediately
+                        continue;
+                    }
+                    sleep(RETRY_DELAY * (attempt + 1));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "Operation failed after retries".to_string()))
     }
 
     pub fn get_entitlements(&mut self) -> Result<Vec<String>, String> {
-        let obj = self.request("prodGetEntitlements", 100, Some(ureq::json!({
-            "returnType": "productCodes"
-        })))?;
+        self.with_retry(|client| {
+            let obj = client.request("prodGetEntitlements", 100, Some(ureq::json!({
+                "returnType": "productCodes"
+            })))?;
 
-        if let Some(obj) = obj.as_object() {
-            if let Some(codes) = obj.get("productCodes") {
-                if let Some(codes) = codes.as_array() {
-                    Ok(codes.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            if let Some(obj) = obj.as_object() {
+                if let Some(codes) = obj.get("productCodes") {
+                    if let Some(codes) = codes.as_array() {
+                        Ok(codes.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                    } else {
+                        Err("Expected productCodes to be an array".to_string())
+                    }
                 } else {
-                    Err("Expected productCodes to be an array".to_string())
+                    Err("Could not find product codes".to_string())
                 }
-             } else {
-                Err("Could not find product codes".to_string())
+            } else {
+                Err(format!("Expected and object got: {:?}", obj))
             }
-        } else {
-            Err(format!("Expected and object got: {:?}", obj))
-        }
+        })
     }
 
     pub fn request_medium(&mut self, medium_id: u64) -> Result<String, String> {
-        let resp = self.request("prodRequestMedium", 100, Some(ureq::json!({
-            "application": APPLICATION,
-            "mediumId": medium_id
-        })))?;
+        self.with_retry(|client| {
+            let resp = client.request("prodRequestMedium", 100, Some(ureq::json!({
+                "application": APPLICATION,
+                "mediumId": medium_id
+            })))?;
 
-        if let Some(obj) = resp.as_object() {
-            if let Some(url) = obj.get("downloadUrl") {
-                Ok(url.as_str().unwrap().to_string())
+            if let Some(obj) = resp.as_object() {
+                if let Some(url) = obj.get("downloadUrl") {
+                    Ok(url.as_str().unwrap().to_string())
+                } else {
+                    Err("downloadUrl not found".to_string())
+                }
             } else {
-                Err("downloadUrl not found".to_string())
+                Err(format!("Expected an object, got: {:?}", resp))
             }
-        } else {
-            Err(format!("Expected an object, got: {:?}", resp))
-        }
+        })
     }
 
     pub fn get_products(&mut self, product_codes: &Vec<String>) -> Result<Vec<Product>, String> {
-        let mut result = Vec::new();
-        for pcodes in product_codes.chunks(5) {
-            let mut chunk = self.get_products_batch(&pcodes.to_vec())?;
-
-            result.append(&mut chunk);
-        }
-
-        Ok(result)
+        self.with_retry(|client| {
+            let mut result = Vec::new();
+            for pcodes in product_codes.chunks(5) {
+                let mut chunk = client.get_products_batch(&pcodes.to_vec())?;
+                result.append(&mut chunk);
+                sleep(REQUEST_DELAY);
+            }
+            Ok(result)
+        })
     }
 
     // apparently the API can not handle large numbers of product codes so we have to batch the requests
